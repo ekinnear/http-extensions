@@ -130,11 +130,11 @@ certificates can also be supplied into these collections.
 
 ## HTTP-Layer Certificate Authentication
 
-This document defines HTTP/2 and HTTP/3 `SERVER_CERTIFICATE` frames ({{certs-http}})
-to carry the relevant certificate messages, enabling certificate-based
-authentication of servers independent of TLS version. This mechanism can be
-implemented at the HTTP layer without breaking the existing interface between
-HTTP and applications above it.
+This document defines HTTP/2 and HTTP/3 `SERVER_CERTIFICATE` frames
+({{certs-http}}) to carry the relevant certificate messages, enabling
+certificate-based authentication of servers independent of TLS version. This
+mechanism can be implemented at the HTTP layer without breaking the existing
+interface between HTTP and applications above it.
 
 TLS Exported Authenticators {{EXPORTED-AUTH}} allow the opportunity for an
 HTTP/2 and HTTP/3 servers to send certificate frames which can be used to prove
@@ -151,10 +151,10 @@ HTTP-Layer certificate authentication.
 # Discovering Additional Certificates at the HTTP Layer {#discovery}
 
 A certificate chain with proof of possession of the private key corresponding to
-the end-entity certificate is sent as a sequence of `SERVER_CERTIFICATE` frames (see
-{{http2-cert}}, {{http3-cert}}) to the client. Once the holder of a certificate
-has sent the chain and proof, this certificate chain is cached by the recipient
-and available for future use.
+the end-entity certificate is sent as `SERVER_CERTIFICATE` frames on a dedicated
+certificate stream (see {{http2-cert}}, {{http3-cert}}) to the client. Once the
+holder of a certificate has sent the chain and proof, this certificate chain is
+cached by the recipient and available for future use.
 
 ## Indicating Support for HTTP-Layer Certificate Authentication {#settings-usage}
 
@@ -197,19 +197,19 @@ origins which it is prepared to service on the current connection, and SHOULD
 NOT send them if the client has not indicated support with
 `SETTINGS_HTTP_SERVER_CERT_AUTH`.
 
-A client MUST NOT send certificates to the server. The server SHOULD close the
+A client MUST NOT open certificate streams. The server SHOULD close the
 connection upon receipt of a SERVER_CERTIFICATE frame from a client.
 
 ~~~ drawing
-Client                                               Server
-   <-- (stream 0 / control stream) SERVER_CERTIFICATE --
+Client                                                   Server
+   <-- (cert stream) SERVER_CERTIFICATE [END_AUTHENTICATOR] --
    ...
-   -- (stream N) GET /from-new-origin ----------------->
-   <------------------------------ (stream N) 200 OK ---
+   -- (stream N) GET /from-new-origin --------------------->
+   <-------------------------------- (stream N) 200 OK ---
 ~~~
 {: #ex-http-server-unprompted-basic title="Simple unprompted server authentication"}
 
-A server MAY send a `SERVER_CERTIFICATE` immediately after sending its `SETTINGS`.
+A server MAY open a certificate stream immediately after sending its `SETTINGS`.
 However, it MAY also send certificates at any time later. For example, a proxy
 might discover that a client is interested in an origin that it can reverse
 proxy at the time that a client sends a `CONNECT` request. It can then send
@@ -218,13 +218,13 @@ those origins for the remainder of the connection lifetime.
 {{ex-http-server-unprompted-reverse}} illustrates this behavior.
 
 ~~~ drawing
-Client                                                 Server
-   -- (stream N) CONNECT /to-new-origin ----------------->
-   <---- (stream 0 / control stream) SERVER_CERTIFICATE --
-   <---- (stream 0 / control stream) 200 OK --------------
+Client                                                    Server
+   -- (stream N) CONNECT /to-new-origin ------------------>
+   <--- (cert stream) SERVER_CERTIFICATE [END_AUTHENTICATOR] --
+   <--- (stream 0 / control stream) 200 OK ----------------
    ...
-   -- (stream M) GET /to-new-origin --------------------->
-   <------------ (stream M, direct from server) 200 OK ---
+   -- (stream M) GET /to-new-origin ---------------------->
+   <------------- (stream M, direct from server) 200 OK ---
 ~~~
 {: #ex-http-server-unprompted-reverse title="Reverse proxy server authentication"}
 
@@ -251,38 +251,66 @@ The usage of this parameter is described in {{settings-usage}}.
 
 # SERVER_CERTIFICATE frame {#certs-http}
 
-The SERVER_CERTIFICATE frame contains an exported authenticator message from the TLS
-layer that provides a chain of certificates and associated extensions, proving
-possession of the private key corresponding to the end-entity certificate.
+The SERVER_CERTIFICATE frame contains a fragment of an exported authenticator
+message from the TLS layer that provides a chain of certificates and associated
+extensions, proving possession of the private key corresponding to the
+end-entity certificate.
 
-A server sends a SERVER_CERTIFICATE frame on stream 0 for HTTP/2 and on the control
-stream for HTTP/3. The client is permitted to make subsequent requests for
-resources upon receipt of a SERVER_CERTIFICATE frame without further action from the
-server.
+Exported authenticators can be large, particularly when using post-quantum
+certificates, and might exceed the maximum frame size. To avoid head-of-line
+blocking on the control channel and to support arbitrarily large
+authenticators, SERVER_CERTIFICATE frames are sent on dedicated certificate
+streams rather than on stream 0 (HTTP/2) or the control stream (HTTP/3).
 
-Upon receiving a complete series of SERVER_CERTIFICATE frames, the receiver may
-validate the Exported Authenticator value by using the exported authenticator
-API. This returns either an error indicating that the message was invalid or
-the certificate chain and extensions used to create the message.
+In HTTP/2, the server opens a new server-initiated (even-numbered) stream and
+sends one or more SERVER_CERTIFICATE frames on it. In HTTP/3, the server opens a
+new server-initiated unidirectional stream with the CERTIFICATE_STREAM type and
+sends one or more SERVER_CERTIFICATE frames on it. See {{http2-cert}} and
+{{http3-cert}} for details.
+
+The first SERVER_CERTIFICATE frame on a certificate stream declares the total
+size of the authenticator. If the authenticator is too large to fit in a single
+frame, the server sends additional SERVER_CERTIFICATE frames on the same
+stream. The final SERVER_CERTIFICATE frame is marked to indicate that the
+authenticator is complete.
+
+Upon receiving a complete authenticator, the receiver may validate the Exported
+Authenticator value by using the exported authenticator API. This returns
+either an error indicating that the message was invalid or the certificate
+chain and extensions used to create the message.
 
 ## HTTP/2 SERVER_CERTIFICATE frame {#http2-cert}
-A SERVER_CERTIFICATE frame in HTTP/2 (type=0xTBD) carrries a TLS Exported authenticator
-that clients can use to authenticate secondary origins from a sending server.
+A SERVER_CERTIFICATE frame in HTTP/2 (type=0xTBD) carries a fragment of a TLS
+Exported Authenticator that clients can use to authenticate secondary origins
+from a sending server.
 
-The SERVER_CERTIFICATE frame MUST be sent on stream 0. A SERVER_CERTIFICATE frame received on
-any other stream MUST not be used for server authentication.
+The server delivers each authenticator on a dedicated server-initiated
+(even-numbered) stream, called a "certificate stream". The server opens a
+certificate stream by sending a SERVER_CERTIFICATE frame on an even-numbered
+stream identifier that is in the idle state. This is analogous to how
+PUSH_PROMISE reserves streams for server push (see {{Section 8.4 of H2}}), but
+does not require a PUSH_PROMISE frame.
+
+If the authenticator is too large to fit in a single SERVER_CERTIFICATE frame
+(subject to SETTINGS_MAX_FRAME_SIZE; see {{Section 6.5.2 of H2}}), the server
+sends additional SERVER_CERTIFICATE frames on the same stream. The final
+SERVER_CERTIFICATE frame MUST have the END_AUTHENTICATOR flag set. A
+SERVER_CERTIFICATE frame with the END_AUTHENTICATOR flag set MAY have an empty
+Authenticator Fragment.
 
 ~~~~~~~~~~ ascii-art
 SERVER_CERTIFICATE Frame {
   Length (24),
   Type (8) = 0xTBD,
 
-  Unused Flags (8),
+  Unused Flags (7),
+  END_AUTHENTICATOR Flag (1),
 
   Reserved (1),
-  Stream Identifier (31) = 0,
+  Stream Identifier (31),
 
-  Authenticator (..),
+  Authenticator Length (32),
+  Authenticator Fragment (..),
 }
 ~~~~~~~~~~
 {: title="HTTP/2 SERVER_CERTIFICATE Frame"}
@@ -290,58 +318,128 @@ SERVER_CERTIFICATE Frame {
 The Length, Type, Unused Flag(s), Reserved, and Stream Identifier fields are
 described in {{Section 4 of H2}}.
 
-The SERVER_CERTIFICATE frame does not define any flags.
+The fields of the SERVER_CERTIFICATE frame are:
 
-The authenticator field is a portion of the opaque data returned from the TLS
-connection exported authenticator authenticate API. See {{exp-auth}} for more
-details on the input to this API.
+END_AUTHENTICATOR (0x1):
+: When set, this flag indicates that this frame contains the final fragment of
+  the authenticator. Exactly one SERVER_CERTIFICATE frame on each certificate
+  stream MUST have this flag set.
 
-The SERVER_CERTIFICATE frame applies to the connection, not a specific stream. An
-endpoint MUST treat a SERVER_CERTIFICATE frame with a stream identifier other than
-0x00 as a connection error.
+Authenticator Length:
+: A 32-bit unsigned integer indicating the total size of the authenticator in
+  octets across all SERVER_CERTIFICATE frames on this stream. This value MUST
+  be identical in every SERVER_CERTIFICATE frame on the same certificate
+  stream. This allows the receiver to know the total size upfront and enforce
+  size limits before buffering the full authenticator.
 
-## HTTP/3 SERVER_CERTIFICATE frame {#http3-cert}
-A SERVER_CERTIFICATE frame in HTTP/3 (type=0xTBD) carrries a TLS Exported authenticator
-that clients can use to authenticate secondary origins from a sending server.
+Authenticator Fragment:
+: A portion of the opaque data returned from the TLS connection exported
+  authenticator authenticate API. See {{exp-auth}} for more details on the
+  input to this API. The concatenation of all Authenticator Fragment fields
+  from SERVER_CERTIFICATE frames on a certificate stream, in the order
+  received, forms the complete authenticator.
 
-The SERVER_CERTIFICATE frame MUST be sent on the control stream. A SERVER_CERTIFICATE frame
-received on any other stream MUST not be used for server authentication.
+The SERVER_CERTIFICATE frame applies to the connection, not a specific request.
+A client MUST NOT send SERVER_CERTIFICATE frames. A server MUST NOT send
+SERVER_CERTIFICATE frames on stream 0 or on any client-initiated
+(odd-numbered) stream; a client that receives a SERVER_CERTIFICATE frame on
+such a stream MUST treat this as a connection error.
+
+A server MUST NOT send frames of any other type on a certificate stream. A
+server MUST NOT interleave SERVER_CERTIFICATE frames for the same certificate
+stream with frames on other streams in a way that violates HTTP/2 ordering
+requirements. The client MUST NOT send any frames on a certificate stream.
+
+If the total size of Authenticator Fragment data received on a certificate
+stream does not equal the declared Authenticator Length when END_AUTHENTICATOR
+is received, the client MUST treat this as a stream error of type
+SERVER_CERTIFICATE_LENGTH_INVALID ({{errors}}). If the Authenticator Length
+exceeds a receiver-imposed maximum, the receiver SHOULD reset the stream with
+SERVER_CERTIFICATE_LENGTH_INVALID upon receipt of the first SERVER_CERTIFICATE
+frame.
+
+## HTTP/3 Certificate Stream {#http3-cert}
+
+This document defines a new HTTP/3 unidirectional stream type, the "certificate
+stream" (type=0xTBD). The server opens a new server-initiated unidirectional
+stream with this type to deliver each authenticator.
+
+~~~~~~~~~~ ascii-art
+Certificate Stream {
+  Stream Type (i) = 0xTBD,
+  SERVER_CERTIFICATE Frame (..) ...,
+}
+~~~~~~~~~~
+{: title="HTTP/3 Certificate Stream"}
+
+The certificate stream carries one or more SERVER_CERTIFICATE frames. The stream
+MUST NOT carry any other frame type. Stream FIN indicates the end of the
+certificate stream.
+
+### HTTP/3 SERVER_CERTIFICATE frame {#http3-cert-frame}
+
+A SERVER_CERTIFICATE frame in HTTP/3 (type=0xTBD) carries a fragment of a TLS
+Exported Authenticator that clients can use to authenticate secondary origins
+from a sending server.
 
 ~~~~~~~~~~ ascii-art
 SERVER_CERTIFICATE Frame {
   Type (i) = 0xTBD,
   Length (i),
-  Authenticator (...),
+  Authenticator Length (i),
+  Authenticator Fragment (...),
 }
 ~~~~~~~~~~
 {: title="HTTP/3 SERVER_CERTIFICATE Frame"}
 
 The Type and Length fields are described in {{Section 7.1 of H3}}.
 
-The authenticator field is a portion of the opaque data returned from the TLS
-connection exported authenticator authenticate API. See {{exp-auth}} for more
-details on the input to this API.
+The fields of the SERVER_CERTIFICATE frame are:
 
-The SERVER_CERTIFICATE frame applies to the connection, not a specific stream. An
-endpoint MUST treat a SERVER_CERTIFICATE frame received on any stream other than the
-control stream as a connection error.
+Authenticator Length:
+: A variable-length integer indicating the total size of the authenticator in
+  octets across all SERVER_CERTIFICATE frames on this certificate stream. This
+  value MUST be identical in every SERVER_CERTIFICATE frame on the same
+  certificate stream. This allows the receiver to know the total size upfront
+  and enforce size limits before buffering the full authenticator.
+
+Authenticator Fragment:
+: A portion of the opaque data returned from the TLS connection exported
+  authenticator authenticate API. See {{exp-auth}} for more details on the
+  input to this API. The concatenation of all Authenticator Fragment fields
+  from SERVER_CERTIFICATE frames on the certificate stream, in the order
+  received, forms the complete authenticator.
+
+A client MUST NOT open a certificate stream. A server MUST NOT send
+SERVER_CERTIFICATE frames on the control stream or on any client-initiated
+stream; a client that receives a SERVER_CERTIFICATE frame on such a stream MUST
+treat this as a connection error of type H3_FRAME_UNEXPECTED.
+
+If the total size of Authenticator Fragment data received on a certificate
+stream does not equal the declared Authenticator Length when the stream ends,
+the client MUST treat this as a stream error of type
+SERVER_CERTIFICATE_LENGTH_INVALID ({{errors}}). If the Authenticator Length
+exceeds a receiver-imposed maximum, the receiver SHOULD reset the stream with
+SERVER_CERTIFICATE_LENGTH_INVALID upon receipt of the first SERVER_CERTIFICATE
+frame.
 
 ## Exported Authenticator Characteristics {#exp-auth}
 
 The Exported Authenticator API defined in {{EXPORTED-AUTH}} takes as input a
 request, a set of certificates, and supporting information about the
-certificate (OCSP, SCT, etc.). The result is an opaque token which is used
-when generating the `SERVER_CERTIFICATE` frame.
+certificate (OCSP, SCT, etc.). The result is an opaque token which is used when
+generating the `SERVER_CERTIFICATE` frame.
 
-Upon receipt of a `SERVER_CERTIFICATE` frame, an endpoint which has negotiated support
-for secondary certfiicates MUST perform the following steps to validate the
-token it contains:
+Upon receipt of a complete authenticator on a certificate stream (indicated by
+END_AUTHENTICATOR in HTTP/2 or stream FIN in HTTP/3), an endpoint which has
+negotiated support for secondary certfiicates MUST perform the following steps
+to validate the token it contains:
 
 - Using the `get context` API, retrieve the `certificate_request_context` used
-  to generate the authenticator, if any. Because the `certificate_request_context`
-  for spontaneous server certificates is chosen by the server, the usage of
-  the `certificate_request_context` is implementation-dependent. For details,
-  see {{Section 5 of EXPORTED-AUTH}}.
+  to generate the authenticator, if any. Because the
+  `certificate_request_context` for spontaneous server certificates is chosen
+  by the server, the usage of the `certificate_request_context` is
+  implementation-dependent. For details, see {{Section 5 of EXPORTED-AUTH}}.
 - Use the `validate` API to confirm the validity of the authenticator with
   regard to the generated request, if any.
 
@@ -368,6 +466,11 @@ errors are fatal to stream or connection, as appropriate.
 
 SERVER_CERTIFICATE_UNREADABLE (0xERROR-TBD):
 : An exported authenticator could not be validated.
+
+SERVER_CERTIFICATE_LENGTH_INVALID (0xERROR-TBD):
+: The declared Authenticator Length in a SERVER_CERTIFICATE frame exceeds a
+  receiver-imposed maximum, or the total Authenticator Fragment data received
+  on a certificate stream does not match the declared Authenticator Length.
 
 ## Invalid Certificates
 Unacceptable certificates (expired, revoked, or insufficient to satisfy the
@@ -438,16 +541,34 @@ during the processing of a request, potentially multiple times, as
 authentication needs to be prepared to reevaluate the authorization state of a
 request as the set of certificates changes.
 
+## Certificate Stream Resource Exhaustion
+
+Because each authenticator is delivered on a dedicated certificate stream, a
+malicious server could attempt to exhaust client resources by opening a large
+number of certificate streams or by sending very large authenticators. Clients
+SHOULD impose limits on:
+
+- The number of concurrent certificate streams they are willing to process.
+- The maximum Authenticator Length they are willing to accept.
+- The total amount of memory devoted to buffering incomplete authenticators.
+
+A client that receives a SERVER_CERTIFICATE frame with an Authenticator Length
+exceeding its limit SHOULD reset the stream with
+SERVER_CERTIFICATE_LENGTH_INVALID. Clients MAY close the connection if the
+server's behavior appears abusive.
+
 Behavior for TLS-Terminated reverse proxies is also worth considering. If a
 server which situationally reverse-proxies wishes for the client to view a
 request made prior to receipt of certificates as TLS-Terminated, or wishes for
-the client to start a new tunnel alternatively, this document does not currently
-define formal mechanisms to facilitate that intention.
+the client to start a new tunnel alternatively, this document does not
+currently define formal mechanisms to facilitate that intention.
 
 # IANA Considerations
 
-This document registers the `SERVER_CERTIFICATE` frame type and
-`SETTINGS_HTTP_SERVER_CERT_AUTH` setting for both {{H2}} and {{H3}}.
+This document registers the `SERVER_CERTIFICATE` frame type,
+`SETTINGS_HTTP_SERVER_CERT_AUTH` setting, the `CERTIFICATE_STREAM` HTTP/3
+unidirectional stream type, and the `SERVER_CERTIFICATE_LENGTH_INVALID` error
+code for both {{H2}} and {{H3}}.
 
 ## Frame Types
 
@@ -467,6 +588,23 @@ registry established by {{H3}}:
 Value: : TBD
 
 Frame Type: : SERVER_CERTIFICATE
+
+Status: : permanent
+
+Reference: : This document
+
+Change Controller: : IETF
+
+Contact: : ietf-http-wg@w3.org
+
+## Stream Types
+
+This specification registers the following entry in the "HTTP/3 Stream Types"
+registry established by {{H3}}:
+
+Value: : TBD
+
+Stream Type: : CERTIFICATE_STREAM
 
 Status: : permanent
 
@@ -498,6 +636,61 @@ Code: : TBD
 Name: : SETTINGS_HTTP_SERVER_CERT_AUTH
 
 Default: : 0
+
+Reference: : This document
+
+Change Controller: : IETF
+
+Contact: : ietf-http-wg@w3.org
+
+## Error Codes
+
+This specification registers the following entries in the "HTTP/2 Error Code"
+registry defined in {{H2}}:
+
+Code: : TBD
+
+Name: : SERVER_CERTIFICATE_UNREADABLE
+
+Description: : An exported authenticator could not be validated.
+
+Reference: : This document
+
+
+Code: : TBD
+
+Name: : SERVER_CERTIFICATE_LENGTH_INVALID
+
+Description: : An authenticator exceeded size limits or had a length mismatch.
+
+Reference: : This document
+
+
+This specification registers the following entries in the "HTTP/3 Error Codes"
+registry established by {{H3}}:
+
+Value: : TBD
+
+Name: : SERVER_CERTIFICATE_UNREADABLE
+
+Description: : An exported authenticator could not be validated.
+
+Status: : permanent
+
+Reference: : This document
+
+Change Controller: : IETF
+
+Contact: : ietf-http-wg@w3.org
+
+
+Value: : TBD
+
+Name: : SERVER_CERTIFICATE_LENGTH_INVALID
+
+Description: : An authenticator exceeded size limits or had a length mismatch.
+
+Status: : permanent
 
 Reference: : This document
 
